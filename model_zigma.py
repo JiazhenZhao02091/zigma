@@ -64,16 +64,31 @@ def t2i_modulate(x, shift, scale):
 
 
 class PatchEmbed_Video(PatchEmbed):
-    """2D Image to Patch Embedding"""
+    """Video to Patch Embedding allowing custom input channels."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        img_size=224,
+        patch_size=16,
+        in_chans=3,
+        embed_dim=768,
+        bias=True,
+        **kwargs,
+    ):
+        super().__init__(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=in_chans,
+            embed_dim=embed_dim,
+            bias=bias,
+            **kwargs,
+        )
 
     def forward(self, x):
+        # x: (B, T, C, H, W)
         B, T, C, H, W = x.shape
         x = rearrange(x, "b t c h w -> (b t) c h w")
         x = super().forward(x)
-        # (b t) n c
         x = rearrange(x, "(b t) n c -> b (t n) c", t=T)
         return x
 
@@ -607,7 +622,11 @@ class ZigMa(nn.Module):
         if video_frames == 0:
             self.x_embedder = (
                 PatchEmbed(
-                    img_dim, patch_size, self.in_channels, self.embed_dim, bias=True
+                    img_dim,
+                    patch_size,
+                    in_chans=self.in_channels,
+                    embed_dim=self.embed_dim,
+                    bias=True,
                 )
                 .to(device)
                 .to(dtype)
@@ -615,7 +634,11 @@ class ZigMa(nn.Module):
         else:
             self.x_embedder = (
                 PatchEmbed_Video(
-                    img_dim, patch_size, self.in_channels, self.embed_dim, bias=True
+                    img_dim,
+                    patch_size,
+                    in_chans=self.in_channels,
+                    embed_dim=self.embed_dim,
+                    bias=True,
                 )
                 .to(device)
                 .to(dtype)
@@ -729,6 +752,13 @@ class ZigMa(nn.Module):
                 raise ValueError(f"scan_type {scan_type} doenst match")
             print("zigzag_num", len(zz_paths))
             #############
+            if video_frames > 0:
+                zz_paths = [
+                    np.concatenate(
+                        [p + i * num_patches for i in range(video_frames)]
+                    )
+                    for p in zz_paths
+                ]
             zz_paths_rev = [reverse_permut_np(_) for _ in zz_paths]
             zz_paths = zz_paths * depth
             zz_paths_rev = zz_paths_rev * depth
@@ -920,6 +950,16 @@ class ZigMa(nn.Module):
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
+        if hidden_states.dim() == 5:
+            _B, frames, _C, _H, _W = hidden_states.shape
+        elif isinstance(self.x_embedder, PatchEmbed_Video):
+            # allow single frame input for video models
+            _B, _C, _H, _W = hidden_states.shape
+            hidden_states = hidden_states.unsqueeze(1)
+            frames = 1
+        else:
+            frames = 1
+
         hidden_states = self.x_embedder(
             hidden_states
         )  # (N, T, D), where T = H * W / patch_size ** 2, if video_frames>0, T = H * W * video_frames / patch_size ** 2
@@ -937,19 +977,18 @@ class ZigMa(nn.Module):
             c = t
 
         if self.use_pe == 1 or self.use_pe == 2:
-            hidden_states = hidden_states + self.pos_embed
-        if self.video_frames > 0 and self.tpe:
-            # temporal pos
+            hidden_states = hidden_states + self.pos_embed[:, :_T]
+        if frames > 1 and self.tpe:
             hidden_states = rearrange(
-                hidden_states, "b (t l) c -> (b l) t c", t=self.video_frames
+                hidden_states, "b (t l) c -> (b l) t c", t=frames
             )
-            hidden_states = hidden_states + self.temporal_pos_embedding
+            hidden_states = hidden_states + self.temporal_pos_embedding[:, :frames]
             hidden_states = rearrange(hidden_states, "(b l) t c -> b (t l) c", b=_B)
 
         residual = None
         for layer_idx, block in enumerate(self.blocks):
             if self.use_pe == 3:
-                hidden_states = hidden_states + self.pos_embed_list[layer_idx]
+                hidden_states = hidden_states + self.pos_embed_list[layer_idx][:, :_T]
             if self.use_checkpoint:
                 hidden_states, residual = torch.utils.checkpoint.checkpoint(
                     self.ckpt_wrapper(block), hidden_states, residual, c, y
@@ -982,8 +1021,8 @@ class ZigMa(nn.Module):
             )
 
         hidden_states = self.final_layer(hidden_states)
-        if self.video_frames > 0:
-            hidden_states = self.unpatchify_video(hidden_states, self.video_frames)
+        if frames > 1:
+            hidden_states = self.unpatchify_video(hidden_states, frames)
         else:
             hidden_states = self.unpatchify(hidden_states)
 
