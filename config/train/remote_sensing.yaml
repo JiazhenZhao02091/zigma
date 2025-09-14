@@ -1,0 +1,15 @@
+defaults:
+  - default
+
+# Path to root directory containing `input` and `target` folders
+data_path: /path/to/remote_sensing
+# Dataloader parameters
+batch_size: 4
+num_workers: 4
+
+# Reconstruction loss type: `l1` or `mse`
+loss_type: l1
+# Optional noise level added to inputs
+noise_std: 0.0
+
+dataset: remote_sensing
