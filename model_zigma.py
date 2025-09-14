@@ -78,6 +78,44 @@ class PatchEmbed_Video(PatchEmbed):
         return x
 
 
+class ConditionEncoder(nn.Module):
+    """Encode conditional reference frames into patch tokens."""
+
+    def __init__(
+        self,
+        img_dim,
+        patch_size,
+        in_channels,
+        embed_dim,
+        frames=0,
+        device="cuda",
+        dtype=torch.float32,
+    ):
+        super().__init__()
+        if frames > 0:
+            self.embedder = (
+                PatchEmbed_Video(img_dim, patch_size, in_channels, embed_dim, bias=True)
+                .to(device)
+                .to(dtype)
+            )
+        else:
+            self.embedder = (
+                PatchEmbed(img_dim, patch_size, in_channels, embed_dim, bias=True)
+                .to(device)
+                .to(dtype)
+            )
+
+    def forward(self, modis=None, landsat=None):
+        tokens = []
+        if modis is not None:
+            tokens.append(self.embedder(modis))
+        if landsat is not None:
+            tokens.append(self.embedder(landsat))
+        if len(tokens) == 0:
+            return None
+        return torch.cat(tokens, dim=1)
+
+
 def exists(val):
     return val is not None
 
@@ -573,6 +611,9 @@ class ZigMa(nn.Module):
         m_init=True,
         use_checkpoint=False,
         dtype=torch.float32,
+        cond_frames: int = 0,
+        cond_channels: int = 0,
+        cond_fuse: str = "concat",
     ):
         # assert num_classes == -1, "num_classes should be -1"
         # assert n_context_token == 0, "n_context_token should be 0"
@@ -589,6 +630,7 @@ class ZigMa(nn.Module):
         self.fused_add_norm = fused_add_norm
         self.video_frames = video_frames
         self.use_pe = use_pe
+        self.cond_fuse = cond_fuse
         num_patches = (img_dim // patch_size) ** 2
         self.use_checkpoint = use_checkpoint
         print(
@@ -620,6 +662,23 @@ class ZigMa(nn.Module):
                 .to(device)
                 .to(dtype)
             )
+
+        if cond_channels > 0:
+            self.condition_encoder = ConditionEncoder(
+                img_dim,
+                patch_size,
+                cond_channels,
+                self.embed_dim,
+                frames=cond_frames,
+                device=device,
+                dtype=dtype,
+            )
+            if cond_fuse == "crossattn":
+                self.cond_attn = CrossAttention(
+                    query_dim=self.embed_dim, context_dim=self.embed_dim
+                )
+        else:
+            self.condition_encoder = None
 
         self.t_embedder = (
             TimestepEmbedder(self.embed_dim, dtype=dtype).to(device).to(dtype)
@@ -913,6 +972,8 @@ class ZigMa(nn.Module):
         hidden_states,
         t,
         y=None,
+        modis_refs=None,
+        landsat_refs=None,
     ):
         """
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images),
@@ -924,6 +985,17 @@ class ZigMa(nn.Module):
             hidden_states
         )  # (N, T, D), where T = H * W / patch_size ** 2, if video_frames>0, T = H * W * video_frames / patch_size ** 2
         _B, _T, _D = hidden_states.shape
+
+        cond_tokens = None
+        if self.condition_encoder is not None:
+            cond_tokens = self.condition_encoder(modis_refs, landsat_refs)
+            if cond_tokens is not None:
+                if self.cond_fuse == "concat":
+                    hidden_states = torch.cat([hidden_states, cond_tokens], dim=1)
+                elif self.cond_fuse == "crossattn":
+                    hidden_states = self.cond_attn(hidden_states, cond_tokens)
+                else:
+                    raise ValueError(f"Unknown cond_fuse {self.cond_fuse}")
 
         t = (t * 1000.0).to(hidden_states)
         t = self.t_embedder(t)  # (N, D)
@@ -982,6 +1054,8 @@ class ZigMa(nn.Module):
             )
 
         hidden_states = self.final_layer(hidden_states)
+        if cond_tokens is not None and self.cond_fuse == "concat":
+            hidden_states = hidden_states[:, :_T, :]
         if self.video_frames > 0:
             hidden_states = self.unpatchify_video(hidden_states, self.video_frames)
         else:

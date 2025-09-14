@@ -4,7 +4,10 @@ params:
     img_dim: 128
     in_channels: 4
     patch_size: 2
-    embed_dim: 768 
-    depth: 24  
+    embed_dim: 768
+    depth: 24
     scan_type: zigzagN8
+    cond_frames: 0
+    cond_channels: 0
+    cond_fuse: concat
    
