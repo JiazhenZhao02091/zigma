@@ -166,6 +166,21 @@ CUDA_VISIBLE_DEVICES="2" accelerate launch  --num_processes 1 --num_machines 1  
 ```
 The sampled images will be saved both on wandb (disable with `use_wandb=False`) and directory **samples/**
 
+## 📈 Evaluation
+
+Use `inference_remote.py` to generate images from a trained checkpoint and
+evaluate reconstruction metrics. The script will report PSNR, SSIM and the
+spectral angle mapper (SAM) and stores the predicted images to the output
+directory.
+
+```bash
+python inference_remote.py ckpt=checkpoints/your_model.pt out_dir=predictions
+```
+
+* **PSNR** – Peak Signal-to-Noise Ratio measuring per-pixel fidelity.
+* **SSIM** – Structural Similarity Index focusing on structural alignment.
+* **SAM** – Spectral Angle Mapper for multi-spectral remote sensing imagery.
+
 
 ##  🛠️  Environment Preparation
 
