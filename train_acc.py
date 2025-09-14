@@ -8,6 +8,8 @@ import shutil
 from einops import rearrange
 from omegaconf import OmegaConf
 from datasets.wds_dataloader import WebDataModuleFromConfig
+from datasets.remote_sensing_dataset import RemoteSensingDataset
+import torch.nn.functional as F
 import torch
 from diffusers import StableDiffusionPipeline
 from my_metrics import MyMetric
@@ -142,7 +144,11 @@ def main(args):
     slurm_job_id = os.environ.get("SLURM_JOB_ID")
     logging.info(f"slurm_job_id: {slurm_job_id}")
 
-    local_bs = args.data.batch_size
+    local_bs = (
+        args.train.batch_size
+        if getattr(args.train, "dataset", "") == "remote_sensing"
+        else args.data.batch_size
+    )
 
     train_steps = 0
 
@@ -243,8 +249,19 @@ def main(args):
 
     logger.info(f"#parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    datamod = WebDataModuleFromConfig(**args.data)
-    loader = datamod.train_dataloader()
+    if getattr(args.train, "dataset", "") == "remote_sensing":
+        rs_dataset = RemoteSensingDataset(args.train.data_path)
+        loader = torch.utils.data.DataLoader(
+            rs_dataset,
+            batch_size=args.train.batch_size,
+            shuffle=True,
+            num_workers=getattr(args.train, "num_workers", 4),
+            drop_last=True,
+        )
+    else:
+        datamod = WebDataModuleFromConfig(**args.data)
+        loader = datamod.train_dataloader()
+        
 
     loader, opt, model, ema_model = accelerator.prepare(loader, opt, model, ema_model)
 
@@ -322,7 +339,10 @@ def main(args):
                             f"latent data not supported, args.data.name={args.data.name}"
                         )
                 else:
-                    yield data["image"].to(device), None
+                    if getattr(args.train, "dataset", "") == "remote_sensing":
+                        yield data["input"].to(device), data["target"].to(device)
+                    else:
+                        yield data["image"].to(device), None
 
     def get_real_img_generator():  # [0,255]
         while True:
@@ -332,7 +352,9 @@ def main(args):
                 initial=0,
                 desc="generate_real_img",
             ):
-                if has_text(args):
+                if getattr(args.train, "dataset", "") == "remote_sensing":
+                    yield out2img(data["target"]).to(device)
+                elif has_text(args):
                     yield out2img(data["image"]).to(device)
                 elif "facehq" in str(args.data.name):
                     yield out2img(data["image"]).to(device)
@@ -405,23 +427,40 @@ def main(args):
     my_metric = MyMetric(**my_metric_kwargs)
 
     if True:
-        gt_recovered = next(real_img_dg)
-        gt_recovered = accelerator.gather(gt_recovered.contiguous())
-        if accelerator.is_main_process and args.use_wandb:
-            if is_video(args):
-                wandb_dict = {
-                    "vis/gt_recovered": wandb.Video(
-                        gt_recovered[:100].detach().cpu().numpy(), fps=1
-                    )
-                }
-            else:
-                wandb_dict = {
-                    "vis/gt_recovered": wandb.Image(
-                        array2grid_pixel(gt_recovered[:100])
-                    )
-                }
-            wandb.log(wandb_dict)
-            logging.info(wandb_project_url + "\n" + wandb_sync_command)
+        if getattr(args.train, "dataset", "") == "remote_sensing":
+            sample_in, sample_tgt = next(train_dg)
+            sample_in = accelerator.gather(sample_in.contiguous())
+            sample_tgt = accelerator.gather(sample_tgt.contiguous())
+            if accelerator.is_main_process and args.use_wandb:
+                wandb.log(
+                    {
+                        "vis/example_input": wandb.Image(
+                            array2grid_pixel(out2img(sample_in[:100]))
+                        ),
+                        "vis/example_target": wandb.Image(
+                            array2grid_pixel(out2img(sample_tgt[:100]))
+                        ),
+                    }
+                )
+                logging.info(wandb_project_url + "\n" + wandb_sync_command)
+        else:
+            gt_recovered = next(real_img_dg)
+            gt_recovered = accelerator.gather(gt_recovered.contiguous())
+            if accelerator.is_main_process and args.use_wandb:
+                if is_video(args):
+                    wandb_dict = {
+                        "vis/gt_recovered": wandb.Video(
+                            gt_recovered[:100].detach().cpu().numpy(), fps=1
+                        )
+                    }
+                else:
+                    wandb_dict = {
+                        "vis/gt_recovered": wandb.Image(
+                            array2grid_pixel(gt_recovered[:100])
+                        )
+                    }
+                wandb.log(wandb_dict)
+                logging.info(wandb_project_url + "\n" + wandb_sync_command)
 
     while train_steps < args.data.train_steps:
         x, y = next(train_dg)
@@ -437,8 +476,19 @@ def main(args):
         model_kwargs = dict(y=y)
         before_forward = torch.cuda.memory_allocated(device)
 
-        loss_dict = transport.training_losses(model, x, model_kwargs)
-        loss = loss_dict["loss"].mean()
+        if getattr(args.train, "loss_type", None) in ["l1", "mse"]:
+            noise_std = getattr(args.train, "noise_std", 0.0)
+            x_in = x + torch.randn_like(x) * noise_std if noise_std > 0 else x
+            pred = model(x_in, **model_kwargs)
+            if args.train.loss_type == "l1":
+                loss = F.l1_loss(pred, y)
+            else:
+                loss = F.mse_loss(pred, y)
+            loss_dict = {"loss": loss}
+        else:
+            loss_dict = transport.training_losses(model, x, model_kwargs)
+            loss = loss_dict["loss"].mean()
+            pred = None
         after_forward = torch.cuda.memory_allocated(device)
         opt.zero_grad()
         accelerator.backward(loss)
@@ -484,6 +534,21 @@ def main(args):
                         wandb_dict,
                         step=train_steps,
                     )
+                    if (
+                        getattr(args.train, "dataset", "") == "remote_sensing"
+                        and pred is not None
+                    ):
+                        in_vis = out2img(x_img[:sample_vis_n])
+                        pred_vis = out2img(pred[:sample_vis_n])
+                        tgt_vis = out2img(y[:sample_vis_n])
+                        wandb.log(
+                            {
+                                "vis/input": wandb.Image(array2grid_pixel(in_vis)),
+                                "vis/output": wandb.Image(array2grid_pixel(pred_vis)),
+                                "vis/target": wandb.Image(array2grid_pixel(tgt_vis)),
+                            },
+                            step=train_steps,
+                        )
             # Reset monitoring variables:
             running_loss = 0
             log_steps = 0
